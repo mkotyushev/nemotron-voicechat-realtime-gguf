@@ -1,0 +1,183 @@
+# Stream a turn's speech as it is generated, instead of only at turn_end.
+#
+# The tts produces frames throughout a turn, but the wav is written once, at the
+# end -- and the end comes after the drain, which is the longest phase there is.
+# Measured with the Q8_0 build:
+#
+#     turn loop      5.8 - 10.3 s
+#     tts drain      3.6 -  6.7 s   (generating 10-18 s of speech)
+#
+# So a driver hears nothing for the whole of both, then the entire answer at
+# once. The speech for the first words existed seconds earlier.
+#
+# This adds `--stream-audio N` (serve mode only): every N finished frames are
+# decoded and emitted as an `audio_delta` event carrying a wav path, and the
+# remainder is flushed just before `turn_end`. N=8 is ~640 ms.
+#
+# It needs no new state beyond a cursor, because voicechat_tts_write_wav already
+# decodes a few frames of causal run-up before `first` and discards them -- so
+# consecutive ranges join without a seam, which is exactly what the existing
+# mid-session trim relies on.
+#
+# `--stream-dir` says where the chunk wavs go; /tmp is a tmpfs in the container
+# and the driver unlinks each one after reading it. With N=0 (the default)
+# nothing changes, so one-shot `--audio`/`--tts-out` and the existing serve
+# protocol are untouched.
+#
+# Against sansamour/llama-voicechat.cpp @ f45001fc (branch voicechat).
+
+--- a/tools/voicechat/voicechat-cli.cpp
++++ b/tools/voicechat/voicechat-cli.cpp
+@@ -376,6 +376,25 @@
+     // VC_PACE_DUMP=1: one line per speech frame, see tts_feed()
+     bool  pace_dump      = getenv("VC_PACE_DUMP") != nullptr;
+ 
++    // Incremental speech output.
++    //
++    // The tts produces frames as the turn runs, but the wav is only written at
++    // turn_end - and turn_end comes after the drain, which is the longest part
++    // of a turn (measured here: 3.6-6.7 s, generating 10-18 s of speech). So a
++    // driver that waits for the wav hears nothing for seconds after the words
++    // were decided, and then the whole answer at once.
++    //
++    // With stream_chunk > 0 the finished frames are decoded and emitted as they
++    // accumulate, so a client can start playing while the model is still
++    // talking. voicechat_tts_write_wav decodes a few frames of causal run-up
++    // before `first` and throws them away, so consecutive ranges join without a
++    // seam and this needs no state beyond the cursor.
++    int         stream_chunk   = 0;   // frames per chunk, 0 = off
++    std::string stream_dir     = "/tmp";
++    int         tts_turn_first = 0;   // tts frame this turn's speech may start at
++    int         stream_next    = -1;  // next frame to emit, -1 = nothing yet
++    int         stream_seq     = 0;
++
+     std::vector<float> frow, srow, aud;
+ 
+     // VC_DUMP=1: one diagnostic line per frame, see step()
+@@ -406,6 +425,7 @@
+     void reset();
+ 
+     void tts_feed(llama_token tok);
++    void stream_audio(bool flush);
+     bool step(const float * a, bool conditioning, llama_token force_func, bool feed_tts);
+     bool run_system(const std::string & prompt);
+     bool run_turn(const std::string & wav_path, const std::string & out_wav, json & result);
+@@ -578,6 +598,52 @@
+ // Akinas"). Whatever the tts keys off, it is not text arriving in step with
+ // the voice, and a throttle that looks like natural pacing is out of
+ // distribution.
++// Decode and emit whatever speech has piled up since the last call.
++//
++// `flush` empties the buffer at the end of a turn; otherwise a chunk only goes
++// out once stream_chunk frames are ready, because every decode pays for its
++// causal run-up and one frame at a time would be mostly run-up.
++void vc_session::stream_audio(bool flush) {
++    if (!tts || stream_chunk <= 0) {
++        return;
++    }
++    // Nothing is worth sending before the turn's first audible token: the
++    // frames before it are the leading </s><s> pair and the stretch where the
++    // model sat listening, which is silence the client does not need.
++    if (tts_first_tok < 0) {
++        return;
++    }
++    if (stream_next < 0) {
++        // Same trim the final wav uses: start half a second before the first
++        // spoken token so the chunk does not open on a codec transient.
++        stream_next = std::max(tts_turn_first, tts_first_tok - 6);
++    }
++
++    const int have  = voicechat_tts_n_frames(tts);
++    const int ready = have - stream_next;
++    if (ready <= 0 || (!flush && ready < stream_chunk)) {
++        return;
++    }
++
++    char path[1024];
++    snprintf(path, sizeof(path), "%s/vc-delta-%d-%d.wav",
++             stream_dir.c_str(), n_turns, stream_seq);
++
++    if (!voicechat_tts_write_wav(tts, path, stream_next, ready)) {
++        ev.error(std::string("could not write ") + path);
++        // Do not retry the same range forever; skip it and keep the turn alive.
++        stream_next = have;
++        return;
++    }
++
++    ev.emit(json{{"kind", "audio_delta"}, {"turn", n_turns}, {"seq", stream_seq},
++                 {"path", path}, {"first", stream_next}, {"frames", ready},
++                 {"seconds", ready / 12.5}, {"final", flush}});
++
++    stream_next = have;
++    ++stream_seq;
++}
++
+ void vc_session::tts_feed(llama_token tok) {
+     if (!tts) {
+         return;
+@@ -625,6 +691,10 @@
+     }
+     tts_quiet   = quiet ? tts_quiet + 1 : 0;
+     tts_voiced += quiet ? 0 : 1;
++
++    // Every frame goes through here, in the main loop and in the drain, so this
++    // is the one place that sees all of a turn's speech.
++    stream_audio(false);
+ }
+ 
+ // One 80 ms frame.
+@@ -824,6 +894,9 @@
+     // --------------------------------------------------------- duplex loop
+     const int64_t t_gen    = ggml_time_ms();
+     const int     tts_first = tts ? voicechat_tts_n_frames(tts) : 0;
++    tts_turn_first = tts_first;
++    stream_next    = -1;
++    stream_seq     = 0;
+     tts_first_tok = -1;
+     tts_released  = 0;
+     tts_voiced    = 0;
+@@ -1070,6 +1143,10 @@
+                 n_drain, n_drain / 12.5, ggml_time_ms() - t_drain);
+     }
+ 
++    // Anything still undecoded is the tail of the answer; it must go out
++    // before turn_end or the client loses the last words.
++    stream_audio(true);
++
+     result = json{
+         {"kind",    "turn_end"},
+         {"turn",    n_turns},
+@@ -1320,6 +1397,12 @@
+     std::string say_text;
+     int   say_pace        = 1;
+     bool  serve           = false;
++    // Frames of speech per streamed chunk. 0 keeps the old behaviour: nothing
++    // is heard until the wav is written at turn_end. 8 is ~640 ms, which is
++    // short enough to feel immediate and long enough that the decode's causal
++    // run-up is not most of the work.
++    int   stream_frames   = 0;
++    std::string stream_dir_arg = "/tmp";
+     bool  user_set_temp   = false;
+     float extra_seconds   = 50.0f;   // cap on decoding past the audio
+     float session_seconds = 180.0f;  // cap on the whole timeline; sizes the tts cache
+@@ -1348,6 +1431,10 @@
+                 say_text = argv[++i];
+             } else if (strcmp(argv[i], "--say-pace") == 0 && i + 1 < argc) {
+                 say_pace = std::max(1, atoi(argv[++i]));
++            } else if (strcmp(argv[i], "--stream-audio") == 0 && i + 1 < argc) {
++                stream_frames = std::max(0, atoi(argv[++i]));
++            } else if (strcmp(argv[i], "--stream-dir") == 0 && i + 1 < argc) {
++                stream_dir_arg = argv[++i];
+             } else if (strcmp(argv[i], "--serve") == 0) {
+                 serve = true;
+             } else {
+@@ -1387,6 +1474,9 @@
+     sess.ev.as_json    = serve;
+     sess.n_extra_max   = std::max(1, (int) (extra_seconds * 12.5f));
+     sess.n_frames_max  = std::max(64, (int) (session_seconds * 12.5f));
++    // Streaming only means anything when a driver is reading the events.
++    sess.stream_chunk  = serve ? stream_frames : 0;
++    sess.stream_dir    = stream_dir_arg;
+ 
+     if (!sess.init(params, tts_path, tts_device)) {
+         return 1;

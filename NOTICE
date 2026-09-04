@@ -1,0 +1,20 @@
+This repository contains original deployment, bridge, conversion, and patch
+work licensed under the MIT License in LICENSE.
+
+It builds and patches sansamour/llama-voicechat.cpp, a fork of llama.cpp. Both
+upstream projects are MIT-licensed:
+
+  https://github.com/sansamour/llama-voicechat.cpp
+  https://github.com/ggml-org/llama.cpp
+
+The NVIDIA NemotronLabs VoiceChat model and its weights are not included in
+this repository. download.sh retrieves a community GGUF conversion derived
+from NVIDIA/NVIDIA-NemotronLabs-VoiceChat-11B. The model materials remain
+subject to NVIDIA's OpenMDW License Agreement, version 1.1, and the notices and
+terms in the upstream model repositories:
+
+  https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B
+  https://huggingface.co/hoidhxd/NVIDIA-NemotronLabs-VoiceChat-11B-GGUF
+
+NVIDIA and Nemotron are trademarks and/or names of their respective owner.
+This project is an independent community project and is not an NVIDIA release.

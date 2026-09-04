@@ -1,0 +1,150 @@
+# Prefill the system prompt as a batch instead of decoding one token at a time.
+#
+# VoiceChat carries the system prompt on its perception channel, one token per
+# timeline position.  The original run_system() preserves that layout but calls
+# step() once per token, so a pure conditioning prefix pays generation-style
+# launch overhead for every position.
+#
+# Build the same fused input embeddings for the whole prefix and submit them in
+# logical batches instead.  Ordinary prompts fit in llama.cpp's default 2048
+# token batch and therefore use one llama_decode() call; larger prompts use a
+# few maximum-sized batches.  llama.cpp still splits a logical batch into its
+# configured physical microbatches internally.
+#
+# This deliberately does not compress the prompt: bos + prompt + eos keep their
+# original timeline positions and KV entries.  The system region has no speech
+# output, so it does not advance the independent TTS generator through hundreds
+# of silent frames.  VC_SYSTEM_TTS_PAD=1 restores that upstream behavior for
+# diagnosis.
+#
+# Against sansamour/llama-voicechat.cpp @ f45001fc (branch voicechat).
+
+--- a/tools/voicechat/voicechat-cli.cpp
++++ b/tools/voicechat/voicechat-cli.cpp
+@@ -737,21 +737,112 @@ bool vc_session::run_system(const std::string & prompt) {
+     LOG_INF("system prompt: %d tokens (%.2f s of the timeline)\n",
+             (int) toks.size(), toks.size() / 12.5);
+     ev.emit(json{{"kind", "system_start"}, {"tokens", (int) toks.size()}, {"t", t}});
++
++    if ((int64_t) t + (int64_t) toks.size() > n_frames_max) {
++        ev.error("system prompt does not fit in the remaining session timeline");
++        return false;
++    }
++
++    const int n_batch_max = (int) llama_n_batch(lctx);
++    if (n_batch_max <= 0) {
++        ev.error("llama context has no logical batch capacity");
++        return false;
++    }
++
++    // Keep the single-frame batch used by step() untouched.  This temporary
++    // embedding batch only exists while a session prefix is being conditioned.
++    const int n_batch_alloc = std::min((int) toks.size(), n_batch_max);
++    llama_batch prefill = llama_batch_init(n_batch_alloc, n_embd, 1);
++
++    // The function channel is held at pad throughout conditioning.  Reading
++    // its embedding once is equivalent to step() reading fprev on every frame.
++    if (has_fhead && !embd.row(fprev, frow.data())) {
++        LOG_ERR("cannot read embedding row for system function token %d\n", fprev);
++        llama_batch_free(prefill);
++        return false;
++    }
++
++    const int64_t t0 = ggml_time_ms();
++    int n_done = 0;
++    while (n_done < (int) toks.size()) {
++        const int n_now = std::min(n_batch_max, (int) toks.size() - n_done);
++        prefill.n_tokens = n_now;
++
++        for (int i = 0; i < n_now; ++i) {
++            const int ti = n_done + i;
++            float * dst = prefill.embd + (size_t) i * n_embd;
++
++            // Conditioning fixes both output channels to pad.  Therefore only
++            // the first position sees the session's initial text bos; every
++            // later position sees the previous frame's forced pad, exactly as
++            // the old step()-per-token loop did.
++            const llama_token text_prev = ti == 0 ? prev : tok_pad;
++            if (!embd.row(text_prev, dst)) {
++                LOG_ERR("cannot read embedding row for system text token %d\n", text_prev);
++                llama_batch_free(prefill);
++                return false;
++            }
++            if (!embd.row(toks[ti], srow.data())) {
++                LOG_ERR("cannot read embedding row for system token %d\n", toks[ti]);
++                llama_batch_free(prefill);
++                return false;
++            }
++
++            if (has_fhead) {
++                for (int j = 0; j < n_embd; ++j) {
++                    dst[j] = fhead.w_text * dst[j] + fhead.w_func * frow[j] +
++                             fhead.w_audio * srow[j];
++                }
++            } else {
++                for (int j = 0; j < n_embd; ++j) {
++                    dst[j] += srow[j];
++                }
++            }
++
++            prefill.pos[i]        = t + i;
++            prefill.n_seq_id[i]   = 1;
++            prefill.seq_id[i][0]  = 0;
++            prefill.logits[i]     = false;
++        }
++        // KV state is all conditioning needs.  Asking for only the last output
++        // keeps llama.cpp's output bookkeeping valid without projecting every
++        // prompt position to logits and hidden states.
++        prefill.logits[n_now - 1] = true;
++
++        if (llama_decode(lctx, prefill) != 0) {
++            LOG_ERR("llama_decode failed while prefilling system frames %d..%d\n",
++                    n_done, n_done + n_now - 1);
++            llama_batch_free(prefill);
++            return false;
++        }
++
++        t      += n_now;
++        n_done += n_now;
++        ev.progress(t, "system", (int) toks.size() - n_done);
++    }
++    llama_batch_free(prefill);
++    const int64_t llm_ms = ggml_time_ms() - t0;
++
++    // System conditioning has no assistant output: both channels are forced to
++    // pad and these positions belong to no turn's wav.  The TTS has its own
++    // timeline and already works after an empty prompt, so do not spend one
++    // stateful codec step per system token generating a silent prefix.  Keep a
++    // compatibility switch for direct A/B diagnosis against upstream.
++    int64_t tts_ms = 0;
++    if (getenv("VC_SYSTEM_TTS_PAD")) {
++        const int64_t t_tts = ggml_time_ms();
++        for (size_t i = 1; i < toks.size(); ++i) {
++            tts_feed(tok_pad);
++        }
++        tts_ms = ggml_time_ms() - t_tts;
++    }
++
++    last_text = prev  = tok_pad;
++    last_func = fprev = tok_pad;
+ 
+-    const int64_t t0 = ggml_time_ms();
+-    for (size_t i = 0; i < toks.size(); ++i) {
+-        if (!embd.row(toks[i], srow.data())) {
+-            LOG_ERR("cannot read embedding row for system token %d\n", toks[i]);
+-            return false;
+-        }
+-        if (!step(srow.data(), /*conditioning =*/ true, -1, /*feed_tts =*/ true)) {
+-            return false;
+-        }
+-        if ((i % 4) == 0) {
+-            ev.progress(t, "system", (int) (toks.size() - i));
+-        }
+-    }
+-    LOG_INF("system prompt: %" PRId64 " ms\n", ggml_time_ms() - t0);
++    LOG_INF("system prompt: %" PRId64 " ms (llm prefill %" PRId64
++            " ms, tts pads %" PRId64 " ms)\n",
++            ggml_time_ms() - t0, llm_ms, tts_ms);
+     sys_done = true;
+     return true;
+ }

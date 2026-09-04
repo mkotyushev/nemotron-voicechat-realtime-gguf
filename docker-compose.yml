@@ -1,0 +1,61 @@
+name: nemotron-voicechat
+
+services:
+  voicechat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VC_REF: ${VC_REF:?set VC_REF in .env}
+        CUDA_ARCH: ${CUDA_ARCH:-86}
+        CUDA_VERSION: ${CUDA_VERSION:-12.8.1}
+    image: nemotron-voicechat:${VC_REF}
+    container_name: nemotron-voicechat
+    restart: unless-stopped
+
+    gpus: all
+
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${PORT:-9070}:8080"
+
+    volumes:
+      - ${MODEL_DIR:-./models}:/models:ro
+
+    tmpfs:
+      - /tmp:size=1g
+
+    environment:
+      BRIDGE_PORT: 8080
+      VC_MODEL_DIR: /models
+      SRC_QUANT: ${SRC_QUANT:-Q8_0}
+      ASR_MODEL: ${ASR_MODEL:-container}
+      N_GPU_LAYERS: ${N_GPU_LAYERS:-99}
+      SESSION_SECONDS: ${SESSION_SECONDS:-180}
+      EXTRA_DECODING_SECONDS: ${EXTRA_DECODING_SECONDS:-50}
+      TEMP: ${TEMP:-0.0}
+      VAD_SILENCE_MS: ${VAD_SILENCE_MS:-700}
+      VAD_MARGIN: ${VAD_MARGIN:-3.5}
+      VAD_MIN_SPEECH_MS: ${VAD_MIN_SPEECH_MS:-350}
+      VAD_MAX_TURN_MS: ${VAD_MAX_TURN_MS:-30000}
+      VC_NO_BARGE: ${VC_NO_BARGE:-1}
+      VC_FORCE_BOS: ${VC_FORCE_BOS:-1}
+      VC_QUIET: ${VC_QUIET:-10}
+      STREAM_FRAMES: ${STREAM_FRAMES:-8}
+      TOOL_TIMEOUT_S: ${TOOL_TIMEOUT_S:-60}
+      VC_STREAM_COMPARE: ${VC_STREAM_COMPARE:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+    stop_grace_period: 30s
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8080/v1/realtime/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 300s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

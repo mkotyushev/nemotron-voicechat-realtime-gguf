@@ -1,0 +1,157 @@
+# Teach the VoiceChat converters to read a Q8_0 source container.
+# 
+# The published `llamacpp/` folder in hoidhxd/NVIDIA-NemotronLabs-VoiceChat-11B-GGUF
+# holds only the Q4_0 split, so a Q8_0 set has to be made from the Q8_0 container
+# with these same three converters. They do not read one as shipped:
+# 
+#   vc_gguf.GGUFSource.f32() has a dequantizer for Q4_0 and none for Q8_0, so it
+#   exits with "cannot read Q8_0 as float" the first time the perception or TTS
+#   converter needs a quantized tensor as a float — which both do, because a few
+#   tensors are added rather than multiplied and ggml wants those dense.
+# 
+# Nothing about the copy path changes: quantized tensors still move block for
+# block and stay bit-identical, Q8_0 in, Q8_0 out. Only the handful of tensors
+# that were already being dequantized in the Q4_0 flow are affected.
+# 
+# Three changes:
+# 
+#   1. vc_gguf.dequant_q8_0, and the f32() branch that calls it. Q8_0 is 32
+#      elements per block, an f16 scale then 32 signed bytes.
+#   2. The same branch in convert_voicechat_to_nemotron_h.py, which carries its
+#      own reader. In practice it should never fire: the tensors that converter
+#      reads as float are all rank-1 and both published quantizations keep those
+#      at F16 on purpose. It is there so a hand-rolled requantization that broke
+#      that rule fails softly rather than at the last block.
+#   3. general.file_type follows the source instead of being hardcoded Q4_0.
+#      Metadata only, but it is in every log line that names the file.
+# 
+# Against sansamour/llama-voicechat.cpp @ f45001fc (branch voicechat).
+
+--- a/tools/voicechat/vc_gguf.py	2026-08-29 12:19:35.584011100 +0500
++++ b/tools/voicechat/vc_gguf.py	2026-08-29 12:20:03.281440100 +0500
+@@ -46,6 +46,33 @@
+     return out.reshape(-1)
+ 
+ 
++def dequant_q8_0(raw: bytes, n_elements: int) -> np.ndarray:
++    """Q8_0: per block of 32, one f16 scale then 32 signed bytes."""
++    n_blocks = n_elements // 32
++    b = np.frombuffer(raw, dtype=np.uint8).reshape(n_blocks, 34)
++    d = b[:, :2].copy().view(np.float16).astype(np.float32)  # {n_blocks, 1}
++    q = b[:, 2:].view(np.int8).astype(np.float32)
++    return (q * d).reshape(-1)
++
++
++def file_type_for(path) -> int:
++    """general.file_type for the output, taken from the source file's name.
++
++    Only metadata — llama.cpp prints it and does not gate on it — but a Q8_0
++    set that announces itself as Q4_0 is a lie in every log line that mentions
++    it. The converters upstream hardcode Q4_0 because that is the only
++    quantization the published `llamacpp/` folder was built from.
++    """
++    import gguf
++
++    name = str(path)
++    if "Q8_0" in name:
++        return gguf.LlamaFileType.MOSTLY_Q8_0
++    if "Q4_0" in name:
++        return gguf.LlamaFileType.MOSTLY_Q4_0
++    return gguf.LlamaFileType.MOSTLY_F16
++
++
+ class GGUFSource:
+     def __init__(self, path: Path):
+         self.path = path
+@@ -143,6 +170,8 @@
+             a = np.frombuffer(self.raw(t), dtype=np.int64).astype(np.float32)
+         elif t["ty"] == "Q4_0":
+             a = dequant_q4_0(self.raw(t), t["elements"])
++        elif t["ty"] == "Q8_0":
++            a = dequant_q8_0(self.raw(t), t["elements"])
+         else:
+             raise SystemExit(f"{name}: cannot read {t['ty']} as float")
+         return a.reshape(tuple(reversed(t["dims"])))
+--- a/tools/voicechat/convert_voicechat_to_nemotron_h.py	2026-08-29 12:19:35.544786300 +0500
++++ b/tools/voicechat/convert_voicechat_to_nemotron_h.py	2026-08-29 12:20:43.535979000 +0500
+@@ -179,13 +179,22 @@
+         return self._raw(self.nbytes(t))
+ 
+     def f32(self, t: dict[str, Any]) -> np.ndarray:
+-        """Read an F16/F32 tensor as F32 in numpy order (reverse of GGUF dims)."""
++        """Read an F16/F32/Q8_0 tensor as F32 in numpy order (reverse of GGUF dims)."""
+         if t["ty"] == "F16":
+             a = np.frombuffer(self.raw(t), dtype=np.float16).astype(np.float32)
+         elif t["ty"] == "F32":
+             a = np.frombuffer(self.raw(t), dtype=np.float32)
++        elif t["ty"] == "Q8_0":
++            # Only reached if a source quantization broke the rank-1 rule; the
++            # published Q4_0 and Q8_0 both keep A_log, D, dt_bias and the norms
++            # at F16, which is the whole set this reads as float. Dequantizing
++            # is still better than aborting the run at the last block.
++            n_blocks = t["elements"] // 32
++            b = np.frombuffer(self.raw(t), dtype=np.uint8).reshape(n_blocks, 34)
++            d = b[:, :2].copy().view(np.float16).astype(np.float32)
++            a = (b[:, 2:].view(np.int8).astype(np.float32) * d).reshape(-1)
+         else:
+-            raise SystemExit(f"{t['name']}: expected F16/F32, got {t['ty']}")
++            raise SystemExit(f"{t['name']}: expected F16/F32/Q8_0, got {t['ty']}")
+         return a.reshape(tuple(reversed(t["dims"])))
+ 
+ 
+@@ -369,7 +378,14 @@
+     w.add_ssm_group_count(n_group)
+     w.add_ssm_time_step_rank(n_ssm_head)  # llama.cpp stores the mamba2 head count here
+ 
+-    w.add_file_type(gguf.LlamaFileType.MOSTLY_Q4_0)
++    # Metadata only, but a Q8_0 set announcing itself as Q4_0 is a lie in every
++    # log line that mentions it. This converter has its own GGUF reader and does
++    # not import vc_gguf, so the mapping is repeated rather than shared.
++    w.add_file_type(
++        gguf.LlamaFileType.MOSTLY_Q8_0 if "Q8_0" in str(args.input)
++        else gguf.LlamaFileType.MOSTLY_Q4_0 if "Q4_0" in str(args.input)
++        else gguf.LlamaFileType.MOSTLY_F16
++    )
+ 
+     # ---------------------------------------------------------------- vocab
+ 
+--- a/tools/voicechat/convert_voicechat_perception_to_mmproj.py	2026-08-29 12:19:35.527351900 +0500
++++ b/tools/voicechat/convert_voicechat_perception_to_mmproj.py	2026-08-29 12:20:37.845437500 +0500
+@@ -62,7 +62,7 @@
+ sys.path.insert(0, str(Path(__file__).parent))
+ import gguf  # noqa: E402
+ 
+-from vc_gguf import GGML_BLOCK, GGUFSource  # noqa: E402
++from vc_gguf import GGML_BLOCK, GGUFSource, file_type_for  # noqa: E402
+ 
+ logger = logging.getLogger("voicechat-mmproj")
+ 
+@@ -122,7 +122,7 @@
+     w.add_audio_conv_kernel_size(CONV_KERNEL_SIZE)
+     w.add_audio_window_size(ATT_LEFT_CONTEXT)
+ 
+-    w.add_file_type(gguf.LlamaFileType.MOSTLY_Q4_0)
++    w.add_file_type(file_type_for(args.input))
+ 
+     n_copied = 0
+     n_conv = 0
+--- a/tools/voicechat/convert_voicechat_tts_to_gguf.py	2026-08-29 12:19:35.567385400 +0500
++++ b/tools/voicechat/convert_voicechat_tts_to_gguf.py	2026-08-29 12:20:37.861125700 +0500
+@@ -60,7 +60,7 @@
+ sys.path.insert(0, str(Path(__file__).parent))
+ import gguf  # noqa: E402
+ 
+-from vc_gguf import GGML_BLOCK, GGUFSource  # noqa: E402
++from vc_gguf import GGML_BLOCK, GGUFSource, file_type_for  # noqa: E402
+ 
+ logger = logging.getLogger("voicechat-tts")
+ 
+@@ -120,7 +120,7 @@
+     w.add_value_length(bb["head_dim"])
+     w.add_sliding_window(bb["sliding_window"])
+     w.add_layer_norm_rms_eps(1e-6)
+-    w.add_file_type(gguf.LlamaFileType.MOSTLY_Q4_0)
++    w.add_file_type(file_type_for(args.input))
+ 
+     # generator and codec hyper-parameters, under a private prefix
+     kv = {

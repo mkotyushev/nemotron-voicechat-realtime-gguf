@@ -1,0 +1,1066 @@
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index d3c124e6..4a9c84d3 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -178,6 +178,10 @@ struct clip_ctx {
+     std::mt19937 rng{std::random_device{}()};
+     uint32_t rng_seed = UINT32_MAX;
+ 
++    int voicechat_stream_channel_len = 0;
++    std::vector<float> voicechat_stream_channel;
++    std::vector<float> voicechat_stream_time;
++
+     clip_ctx(clip_context_params & ctx_params) {
+         flash_attn_type = ctx_params.flash_attn_type;
+         no_alloc = ctx_params.no_alloc;
+@@ -1103,7 +1107,9 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const
+             } break;
+         case PROJECTOR_TYPE_VOICECHAT:
+             {
+-                builder = std::make_unique<clip_graph_voicechat>(ctx, img);
++                const bool streaming = params && params->voicechat_streaming;
++                const int drop = streaming ? params->voicechat_drop_pre_encoded : 0;
++                builder = std::make_unique<clip_graph_voicechat>(ctx, img, streaming, drop);
+             } break;
+         case PROJECTOR_TYPE_GRANITE4_VISION:
+             {
+@@ -4320,6 +4326,50 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
+     return clip_encode(ctx, &params);
+ }
+ 
++void clip_voicechat_stream_reset(clip_ctx * ctx) {
++    GGML_ASSERT(ctx != nullptr);
++    GGML_ASSERT(ctx->model.proj_type == PROJECTOR_TYPE_VOICECHAT);
++
++    const int n_layer = ctx->model.hparams.n_layer;
++    const int n_state = ctx->model.hparams.n_embd;
++    const int n_cache = ctx->model.hparams.attn_window_size;
++    const int n_time  = ctx->model.hparams.audio_conv_kernel_size - 1;
++
++    ctx->voicechat_stream_channel_len = 0;
++    ctx->voicechat_stream_channel.assign((size_t) n_layer * n_state * n_cache, 0.0f);
++    ctx->voicechat_stream_time.assign((size_t) n_layer * n_state * n_time, 0.0f);
++}
++
++bool clip_voicechat_stream_encode(clip_ctx * ctx, int n_threads, const clip_image_f32 * mel,
++                                  int drop_pre_encoded, std::vector<float> & out_vec) {
++    if (ctx->model.proj_type != PROJECTOR_TYPE_VOICECHAT) {
++        LOG_ERR("%s: projector is not voicechat\n", __func__);
++        return false;
++    }
++    if (ctx->voicechat_stream_channel.empty() || ctx->voicechat_stream_time.empty()) {
++        clip_voicechat_stream_reset(ctx);
++    }
++
++    clip_image_f32_batch imgs;
++    imgs.is_audio = true;
++    imgs.entries.push_back(*mel);
++
++    const int n_tokens = clip_voicechat_n_frames_out(mel->nx()) - drop_pre_encoded;
++    if (n_tokens <= 0) {
++        LOG_ERR("%s: input has no post-drop frames\n", __func__);
++        return false;
++    }
++    out_vec.resize((size_t) n_tokens * clip_n_mmproj_embd(ctx));
++
++    clip_encode_params params;
++    params.imgs = &imgs;
++    params.n_threads = n_threads;
++    params.out_embd = &out_vec;
++    params.voicechat_streaming = true;
++    params.voicechat_drop_pre_encoded = drop_pre_encoded;
++    return clip_encode(ctx, &params);
++}
++
+ // persisted state slots of the gen-audio decoder, per pipeline
+ static std::vector<c2w_state_slot> list_gen_state_slots(const clip_hparams & hparams, const clip_model & model) {
+     switch (model.proj_type) {
+@@ -4393,6 +4443,24 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+         ggml_backend_tensor_set(cur, values.data(), 0, ggml_nbytes(cur));
+     };
+ 
++    if (params->voicechat_streaming) {
++        const int n_layer = hparams.n_layer;
++        const int n_state = hparams.n_embd;
++        const int n_cache = hparams.attn_window_size;
++        const int n_time  = hparams.audio_conv_kernel_size - 1;
++        GGML_ASSERT(ctx->voicechat_stream_channel.size() == (size_t) n_layer * n_state * n_cache);
++        GGML_ASSERT(ctx->voicechat_stream_time.size() == (size_t) n_layer * n_state * n_time);
++
++        for (int il = 0; il < n_layer; ++il) {
++            ggml_tensor * ch = get_inp_tensor(string_format("voicechat_cache_ch_in_%d", il).c_str());
++            ggml_tensor * tm = get_inp_tensor(string_format("voicechat_cache_tm_in_%d", il).c_str());
++            const size_t ch_off = (size_t) il * n_state * n_cache;
++            const size_t tm_off = (size_t) il * n_state * n_time;
++            ggml_backend_tensor_set(ch, ctx->voicechat_stream_channel.data() + ch_off, 0, ggml_nbytes(ch));
++            ggml_backend_tensor_set(tm, ctx->voicechat_stream_time.data() + tm_off, 0, ggml_nbytes(tm));
++        }
++    }
++
+     // upload the decoder state from the previous call, or zero-fill on a cold start
+     auto set_gen_state_in = [&]() {
+         size_t offset = 0;
+@@ -5482,8 +5550,12 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+                 std::vector<float> mask_data(n_q * n_k);
+                 for (int q = 0; q < n_q; ++q) {
+                     for (int k = 0; k < n_k; ++k) {
+-                        const int d = q - k;
+-                        mask_data[q * n_k + k] = (d >= 0 && d <= att_left) ? 0.0f : mask_value;
++                        const int q_abs = params->voicechat_streaming ? att_left + q : q;
++                        const int d = q_abs - k;
++                        const int valid_cache_start = params->voicechat_streaming
++                            ? att_left - ctx->voicechat_stream_channel_len : 0;
++                        const bool valid = k >= valid_cache_start && d >= 0 && d <= att_left;
++                        mask_data[q * n_k + k] = valid ? 0.0f : mask_value;
+                     }
+                 }
+                 set_input_f32(attn_mask->name, mask_data);
+@@ -5502,10 +5574,11 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+                 {
+                     ggml_tensor * rel_pos = ggml_graph_get_tensor(gf, "rel_positions");
+                     const int window_size = rel_pos->ne[1];
+-                    const int n_time      = (window_size + 1) / 2;
+                     std::vector<float> pos(window_size);
+                     for (int t = 0; t < window_size; ++t) {
+-                        pos[t] = float(n_time - 1 - t);
++                        pos[t] = params->voicechat_streaming
++                            ? float(n_k - 1 - t)
++                            : float((window_size + 1) / 2 - 1 - t);
+                     }
+                     set_input_f32(rel_pos->name, pos);
+                 }
+@@ -5639,20 +5712,42 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+         return false;
+     }
+ 
++    if (params->voicechat_streaming) {
++        const int n_layer = hparams.n_layer;
++        const int n_state = hparams.n_embd;
++        const int n_cache = hparams.attn_window_size;
++        const int n_time  = hparams.audio_conv_kernel_size - 1;
++        for (int il = 0; il < n_layer; ++il) {
++            ggml_tensor * ch = ggml_graph_get_tensor(gf, string_format("voicechat_cache_ch_out_%d", il).c_str());
++            ggml_tensor * tm = ggml_graph_get_tensor(gf, string_format("voicechat_cache_tm_out_%d", il).c_str());
++            GGML_ASSERT(ch != nullptr && tm != nullptr);
++            const size_t ch_off = (size_t) il * n_state * n_cache;
++            const size_t tm_off = (size_t) il * n_state * n_time;
++            ggml_backend_tensor_get(ch, ctx->voicechat_stream_channel.data() + ch_off, 0, ggml_nbytes(ch));
++            ggml_backend_tensor_get(tm, ctx->voicechat_stream_time.data() + tm_off, 0, ggml_nbytes(tm));
++        }
++        const int n_new = clip_voicechat_n_frames_out(imgs.entries[0].nx()) - params->voicechat_drop_pre_encoded;
++        ctx->voicechat_stream_channel_len = std::min(n_cache, ctx->voicechat_stream_channel_len + n_new);
++    }
++
+     // the last node is the embedding tensor, code2wav has no out_embd
+     ggml_tensor * embeddings = params->out_embd ? ggml_graph_node(gf, -1) : nullptr;
+ 
+     if (embeddings != nullptr) {
+         // sanity check (assuming that all images in batch have the same number of tokens, so we only check the first one)
+         const int n_tokens_out = embeddings->ne[1];
+-        const int expected_n_tokens_out = clip_n_output_tokens(ctx, &imgs.entries[0]);
++        const int expected_n_tokens_out = params->voicechat_streaming
++            ? clip_voicechat_n_frames_out(imgs.entries[0].nx()) - params->voicechat_drop_pre_encoded
++            : clip_n_output_tokens(ctx, &imgs.entries[0]);
+         if (n_tokens_out != expected_n_tokens_out) {
+             LOG_ERR("%s: expected output %d tokens, got %d\n", __func__, expected_n_tokens_out, n_tokens_out);
+             GGML_ABORT("Invalid number of output tokens");
+         }
+ 
+-        LOG_DBG("%s: output embedding shape [%d, %d, %d]\n", __func__,
+-            (int)embeddings->ne[0], (int)embeddings->ne[1], (int)embeddings->ne[2]);
++        if (!params->voicechat_streaming) {
++            LOG_DBG("%s: output embedding shape [%d, %d, %d]\n", __func__,
++                (int)embeddings->ne[0], (int)embeddings->ne[1], (int)embeddings->ne[2]);
++        }
+ 
+         // copy output to user buffer if provided
+         // if output is empty, skip the copy
+diff --git a/tools/mtmd/clip.h b/tools/mtmd/clip.h
+index a5b71377..7a069316 100644
+--- a/tools/mtmd/clip.h
++++ b/tools/mtmd/clip.h
+@@ -86,6 +86,10 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx);
+ bool clip_image_encode      (struct clip_ctx * ctx, int n_threads, const clip_image_f32 * img, std::vector<float> & out_vec);
+ bool clip_image_batch_encode(struct clip_ctx * ctx, int n_threads, const struct clip_image_f32_batch * imgs, std::vector<float> & out_batch_embd);
+ 
++void clip_voicechat_stream_reset(struct clip_ctx * ctx);
++bool clip_voicechat_stream_encode(struct clip_ctx * ctx, int n_threads, const clip_image_f32 * mel,
++                                  int drop_pre_encoded, std::vector<float> & out_vec);
++
+ enum clip_gen_process_type {
+     CLIP_GEN_PROCESS_GEN_UNKNOWN,
+     CLIP_GEN_PROCESS_GEN_CODE, // h_state to codes
+@@ -115,6 +119,9 @@ struct clip_encode_params {
+     std::vector<float> * out_audio = nullptr;         // decoded PCM samples, F32
+     const std::vector<uint8_t> * state_in  = nullptr; // state from previous call, null or wrong size means cold start
+     std::vector<uint8_t> *       state_out = nullptr; // state for the next call
++
++    bool voicechat_streaming = false;
++    int  voicechat_drop_pre_encoded = 0;
+ };
+ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params);
+ 
+diff --git a/tools/mtmd/models/models.h b/tools/mtmd/models/models.h
+index 830a6524..df41e4a9 100644
+--- a/tools/mtmd/models/models.h
++++ b/tools/mtmd/models/models.h
+@@ -395,8 +395,12 @@ struct clip_graph_parakeet : clip_graph {
+ };
+ 
+ struct clip_graph_voicechat : clip_graph {
+-    clip_graph_voicechat(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
++    clip_graph_voicechat(clip_ctx * ctx, const clip_image_f32 & img, bool streaming = false, int drop_pre_encoded = 0)
++        : clip_graph(ctx, img), streaming(streaming), drop_pre_encoded(drop_pre_encoded) {}
+     ggml_cgraph * build() override;
++
++    bool streaming;
++    int  drop_pre_encoded;
+ };
+ 
+ struct clip_graph_exaone4_5 : clip_graph {
+diff --git a/tools/mtmd/models/voicechat.cpp b/tools/mtmd/models/voicechat.cpp
+index 670b075d..d93d0dfe 100644
+--- a/tools/mtmd/models/voicechat.cpp
++++ b/tools/mtmd/models/voicechat.cpp
+@@ -60,6 +60,13 @@ ggml_cgraph * clip_graph_voicechat::build() {
+     cur = ggml_add(ctx0, cur, model.pre_encode_out_b);
+     ggml_set_name(cur, "pre_enc_out");
+ 
++    if (drop_pre_encoded > 0) {
++        GGML_ASSERT(drop_pre_encoded < cur->ne[1]);
++        cur = ggml_view_2d(ctx0, cur, cur->ne[0], cur->ne[1] - drop_pre_encoded,
++                           cur->nb[1], drop_pre_encoded * cur->nb[1]);
++        cur = ggml_cont(ctx0, cur);
++    }
++
+     // encoder
+ 
+     const int   n_layer   = hparams.n_layer;
+@@ -68,12 +75,13 @@ ggml_cgraph * clip_graph_voicechat::build() {
+     const int   d_head    = n_state / n_head;
+     const int   d_half    = n_state / 2;
+     const int   n_time    = cur->ne[1];
++    const int   n_cache   = streaming ? hparams.attn_window_size : 0;
++    const int   n_kv      = n_cache + n_time;
+     const float fc_factor = 0.5f;
+ 
+-    // relative positions run from +(n_time-1) down to -(n_time-1)
+-    const int window_size = 2 * n_time - 1;
++    const int window_size = streaming ? n_kv + n_time - 1 : 2 * n_time - 1;
+ 
+-    ggml_tensor * attn_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_time, n_time);
++    ggml_tensor * attn_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_kv, n_time);
+     ggml_set_name(attn_mask, "attn_mask");
+     ggml_set_input(attn_mask);
+ 
+@@ -117,13 +125,28 @@ ggml_cgraph * clip_graph_voicechat::build() {
+             cur = ggml_norm(ctx0, cur, hparams.eps);
+             cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.ln_1_w), layer.ln_1_b);
+ 
++            ggml_tensor * attn_in = cur;
++            if (streaming) {
++                ggml_tensor * cache = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_state, n_cache);
++                ggml_format_name(cache, "voicechat_cache_ch_in_%d", il);
++                ggml_set_input(cache);
++                attn_in = ggml_concat(ctx0, cache, cur, 1);
++
++                ggml_tensor * cache_out = ggml_view_2d(ctx0, attn_in, n_state, n_cache,
++                                                       attn_in->nb[1], n_time * attn_in->nb[1]);
++                cache_out = ggml_cont(ctx0, cache_out);
++                ggml_format_name(cache_out, "voicechat_cache_ch_out_%d", il);
++                ggml_set_output(cache_out);
++                ggml_build_forward_expand(gf, cache_out);
++            }
++
+             ggml_tensor * Q_cur = build_mm(layer.q_w, cur);
+-            ggml_tensor * K_cur = build_mm(layer.k_w, cur);
+-            ggml_tensor * V_cur = build_mm(layer.v_w, cur);
++            ggml_tensor * K_cur = build_mm(layer.k_w, attn_in);
++            ggml_tensor * V_cur = build_mm(layer.v_w, attn_in);
+ 
+             Q_cur = ggml_reshape_3d(ctx0, Q_cur, d_head, n_head, n_time);
+-            K_cur = ggml_reshape_3d(ctx0, K_cur, d_head, n_head, n_time);
+-            V_cur = ggml_reshape_3d(ctx0, V_cur, d_head, n_head, n_time);
++            K_cur = ggml_reshape_3d(ctx0, K_cur, d_head, n_head, n_kv);
++            V_cur = ggml_reshape_3d(ctx0, V_cur, d_head, n_head, n_kv);
+ 
+             // [d_head, window_size, n_head]
+             ggml_tensor * pos = build_mm(layer.linear_pos_w, pos_emb);
+@@ -146,30 +169,17 @@ ggml_cgraph * clip_graph_voicechat::build() {
+                 const auto n_frame    = rel_pos_scores->ne[1];
+                 const auto n_h        = rel_pos_scores->ne[2];
+ 
+-                rel_pos_scores = ggml_pad(ctx0, rel_pos_scores, 1, 0, 0, 0);
+-                rel_pos_scores = ggml_roll(ctx0, rel_pos_scores, 1, 0, 0, 0);
+-
++                ggml_tensor * zero_shape = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_frame, n_h);
++                ggml_tensor * zeros = ggml_fill(ctx0, zero_shape, 0.0f);
++                rel_pos_scores = ggml_concat(ctx0, zeros, rel_pos_scores, 0);
+                 rel_pos_scores = ggml_reshape_3d(ctx0, rel_pos_scores, n_frame, pos_window + 1, n_h);
++                rel_pos_scores = ggml_view_3d(ctx0, rel_pos_scores, n_frame, pos_window, n_h,
++                                              rel_pos_scores->nb[1], rel_pos_scores->nb[2],
++                                              rel_pos_scores->nb[1]);
+                 rel_pos_scores = ggml_cont(ctx0, rel_pos_scores);
+-
+-                const int    center = pos_window / 2;
+-                const size_t offset = rel_pos_scores->nb[0] * (center + 1);
+-
+-                rel_pos_scores = ggml_view_3d(ctx0, rel_pos_scores,
+-                                              n_frame, pos_window, n_h,
+-                                              pos_window * sizeof(float),
+-                                              rel_pos_scores->nb[2],
+-                                              offset);
+-                rel_pos_scores = ggml_cont(ctx0, rel_pos_scores);
+-
+-                rel_pos_scores = ggml_view_3d(ctx0, rel_pos_scores,
+-                                              content_scores->ne[0],
+-                                              content_scores->ne[1],
+-                                              rel_pos_scores->ne[2],
+-                                              rel_pos_scores->nb[1],
+-                                              rel_pos_scores->nb[2],
+-                                              0);
+-                rel_pos_scores = ggml_cont(ctx0, rel_pos_scores);
++                rel_pos_scores = ggml_reshape_3d(ctx0, rel_pos_scores, pos_window, n_frame, n_h);
++                rel_pos_scores = ggml_view_3d(ctx0, rel_pos_scores, n_kv, n_time, n_h,
++                                              rel_pos_scores->nb[1], rel_pos_scores->nb[2], 0);
+             }
+ 
+             ggml_tensor * attn_scores = ggml_add(ctx0, content_scores, rel_pos_scores);
+@@ -209,11 +219,24 @@ ggml_cgraph * clip_graph_voicechat::build() {
+             // ggml_ssm_conv wants time on ne0 and keeps f32 precision
+             cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+ 
+-            // causal: kernel-1 zeros in front, nothing behind. ggml_pad appends
+-            // them at the end, ggml_roll wraps them around to the front.
+             const int dw_pad = hparams.audio_conv_kernel_size - 1;
+-            cur = ggml_pad(ctx0, cur, dw_pad, 0, 0, 0);
+-            cur = ggml_roll(ctx0, cur, dw_pad, 0, 0, 0);
++            if (streaming) {
++                ggml_tensor * cache = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, dw_pad, n_state);
++                ggml_format_name(cache, "voicechat_cache_tm_in_%d", il);
++                ggml_set_input(cache);
++                cur = ggml_concat(ctx0, cache, cur, 0);
++
++                ggml_tensor * cache_out = ggml_view_2d(ctx0, cur, dw_pad, n_state,
++                                                       cur->nb[1], n_time * cur->nb[0]);
++                cache_out = ggml_cont(ctx0, cache_out);
++                ggml_format_name(cache_out, "voicechat_cache_tm_out_%d", il);
++                ggml_set_output(cache_out);
++                ggml_build_forward_expand(gf, cache_out);
++            } else {
++                // causal: kernel-1 zeros in front, nothing behind
++                cur = ggml_pad(ctx0, cur, dw_pad, 0, 0, 0);
++                cur = ggml_roll(ctx0, cur, dw_pad, 0, 0, 0);
++            }
+ 
+             cur = ggml_ssm_conv(ctx0, cur, layer.conv_dw_w);
+             ggml_format_name(cur, "enc_%d_conv_dw", il);
+diff --git a/tools/mtmd/mtmd-audio.cpp b/tools/mtmd/mtmd-audio.cpp
+index 8870bb8b..a1beef4c 100644
+--- a/tools/mtmd/mtmd-audio.cpp
++++ b/tools/mtmd/mtmd-audio.cpp
+@@ -1170,6 +1170,85 @@ void mtmd_audio_preprocessor_parakeet::initialize() {
+     cache.hann_window = hparams.window;
+ }
+ 
++void mtmd_audio_preprocessor_parakeet::stream_reset() {
++    stream_samples.assign((size_t) hparams.audio_n_fft / 2, 0.0f);
++    stream_n_frames = 0;
++    stream_prev_sample = 0.0f;
++    stream_has_prev_sample = false;
++    stream_is_flushed = false;
++}
++
++bool mtmd_audio_preprocessor_parakeet::stream_push(const float * samples, size_t n_samples,
++                                                    std::vector<mtmd_audio_mel> & output, bool flush) {
++    output.clear();
++    if (norm_per_feature || stream_is_flushed || (n_samples > 0 && samples == nullptr)) {
++        return false;
++    }
++    if (stream_samples.empty()) {
++        stream_reset();
++    }
++
++    for (size_t i = 0; i < n_samples; ++i) {
++        const float raw = samples[i];
++        const float value = stream_has_prev_sample ? raw - 0.97f * stream_prev_sample : raw;
++        stream_samples.push_back(value);
++        stream_prev_sample = raw;
++        stream_has_prev_sample = true;
++    }
++    if (flush) {
++        stream_samples.resize(stream_samples.size() + (size_t) hparams.audio_n_fft / 2, 0.0f);
++        stream_is_flushed = true;
++    }
++
++    const int frame_size = hparams.audio_n_fft;
++    const int frame_step = hparams.audio_hop_len;
++    const int window_size = hparams.audio_window_len;
++    if (stream_samples.size() < (size_t) frame_size) {
++        return true;
++    }
++
++    const size_t n_stable = (stream_samples.size() - frame_size) / frame_step + 1;
++    if (n_stable <= stream_n_frames) {
++        return true;
++    }
++
++    mtmd_audio_mel mel;
++    mel.n_mel = hparams.n_mel_bins;
++    mel.n_len = n_stable - stream_n_frames;
++    mel.n_len_org = mel.n_len;
++    mel.data.resize(mel.n_mel * mel.n_len);
++
++    const int n_fft_bins = frame_size / 2 + 1;
++    const int window_pad_left = (frame_size - window_size) / 2;
++    const double eps = 5.960464477539063e-08;
++    std::vector<float> fft_in(frame_size * 2, 0.0f);
++    std::vector<float> fft_out(frame_size * 2 * 2 * 2);
++
++    for (size_t local = 0; local < mel.n_len; ++local) {
++        const size_t frame = stream_n_frames + local;
++        const size_t offset = frame * frame_step;
++        std::fill(fft_in.begin(), fft_in.end(), 0.0f);
++        for (int j = 0; j < window_size; ++j) {
++            fft_in[window_pad_left + j] = cache.hann_window[j] * stream_samples[offset + window_pad_left + j];
++        }
++        fft(cache, fft_in.data(), frame_size, fft_out.data());
++        for (int j = 0; j < n_fft_bins; ++j) {
++            fft_out[j] = fft_out[2 * j] * fft_out[2 * j] + fft_out[2 * j + 1] * fft_out[2 * j + 1];
++        }
++        for (size_t m = 0; m < mel.n_mel; ++m) {
++            double sum = 0.0;
++            for (int k = 0; k < n_fft_bins; ++k) {
++                sum += fft_out[k] * cache.filters.data[m * n_fft_bins + k];
++            }
++            mel.data[m * mel.n_len + local] = std::log(sum + eps);
++        }
++    }
++
++    stream_n_frames = n_stable;
++    output.push_back(std::move(mel));
++    return true;
++}
++
+ bool mtmd_audio_preprocessor_parakeet::preprocess(const float * samples,
+                                                        size_t   n_samples_in,
+                                   std::vector<mtmd_audio_mel> & output) {
+diff --git a/tools/mtmd/mtmd-audio.h b/tools/mtmd/mtmd-audio.h
+index b030b1c0..00596b07 100644
+--- a/tools/mtmd/mtmd-audio.h
++++ b/tools/mtmd/mtmd-audio.h
+@@ -143,10 +143,17 @@ struct mtmd_audio_preprocessor_parakeet : mtmd_audio_preprocessor {
+         : mtmd_audio_preprocessor(ctx), norm_per_feature(norm_per_feature) { }
+     void initialize() override;
+     bool preprocess(const float * samples, size_t n_samples, std::vector<mtmd_audio_mel> & output) override;
++    void stream_reset();
++    bool stream_push(const float * samples, size_t n_samples, std::vector<mtmd_audio_mel> & output, bool flush);
+ 
+   private:
+     bool norm_per_feature;
+     mtmd_audio_cache cache;
++    std::vector<float> stream_samples;
++    size_t stream_n_frames = 0;
++    float stream_prev_sample = 0.0f;
++    bool stream_has_prev_sample = false;
++    bool stream_is_flushed = false;
+ 
+     static void worker_thread(int ith, const float * window_func, int window_size,
+                               const std::vector<float> & samples, int n_samples,
+diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
+index f17dfb80..61eacc90 100644
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -514,6 +514,9 @@ struct mtmd_context {
+ 
+     std::unique_ptr<mtmd_audio_preprocessor> audio_preproc;
+     std::unique_ptr<mtmd_image_preprocessor> image_preproc;
++    std::vector<std::vector<float>> voicechat_stream_mel;
++    size_t voicechat_stream_mel_consumed = 0;
++    size_t voicechat_stream_n_frames = 0;
+ 
+     // batching
+     int32_t batch_max_tokens;
+@@ -1803,6 +1806,105 @@ float * mtmd_get_output_embd(mtmd_context * ctx) {
+     return ctx->out_embd.data();
+ }
+ 
++int32_t mtmd_voicechat_stream_reset(mtmd_context * ctx) {
++    if (ctx == nullptr || ctx->ctx_a == nullptr ||
++        clip_get_projector_type(ctx->ctx_a) != PROJECTOR_TYPE_VOICECHAT) {
++        return 1;
++    }
++    auto * preproc = dynamic_cast<mtmd_audio_preprocessor_parakeet *>(ctx->audio_preproc.get());
++    if (preproc == nullptr) {
++        return 1;
++    }
++    preproc->stream_reset();
++    clip_voicechat_stream_reset(ctx->ctx_a);
++    ctx->voicechat_stream_mel.clear();
++    ctx->voicechat_stream_mel_consumed = 0;
++    ctx->voicechat_stream_n_frames = 0;
++    ctx->out_embd.clear();
++    return 0;
++}
++
++int32_t mtmd_voicechat_stream_feed(mtmd_context * ctx, const float * samples, size_t n_samples, bool flush) {
++    if (ctx == nullptr || ctx->ctx_a == nullptr ||
++        clip_get_projector_type(ctx->ctx_a) != PROJECTOR_TYPE_VOICECHAT) {
++        return 1;
++    }
++    auto * preproc = dynamic_cast<mtmd_audio_preprocessor_parakeet *>(ctx->audio_preproc.get());
++    if (preproc == nullptr) {
++        return 1;
++    }
++    if (ctx->voicechat_stream_mel.empty()) {
++        preproc->stream_reset();
++        clip_voicechat_stream_reset(ctx->ctx_a);
++    }
++
++    std::vector<mtmd_audio_mel> fresh;
++    if (!preproc->stream_push(samples, n_samples, fresh, flush)) {
++        return 1;
++    }
++    for (const auto & mel : fresh) {
++        if (ctx->voicechat_stream_mel.empty()) {
++            ctx->voicechat_stream_mel.resize(mel.n_mel);
++        }
++        if (ctx->voicechat_stream_mel.size() != mel.n_mel) {
++            return 1;
++        }
++        for (size_t m = 0; m < mel.n_mel; ++m) {
++            const float * row = mel.data.data() + m * mel.n_len;
++            ctx->voicechat_stream_mel[m].insert(ctx->voicechat_stream_mel[m].end(), row, row + mel.n_len);
++        }
++    }
++
++    ctx->out_embd.clear();
++    if (ctx->voicechat_stream_mel.empty()) {
++        return 0;
++    }
++
++    const size_t n_mel = ctx->voicechat_stream_mel.size();
++    const size_t n_have = ctx->voicechat_stream_mel[0].size();
++    auto encode = [&](int64_t start, int n_feed, int drop) {
++        std::vector<float> data(n_mel * (size_t) n_feed, 0.0f);
++        for (size_t m = 0; m < n_mel; ++m) {
++            for (int i = 0; i < n_feed; ++i) {
++                const int64_t src = start + i;
++                if (src >= 0 && (size_t) src < n_have) {
++                    data[m * n_feed + i] = ctx->voicechat_stream_mel[m][(size_t) src];
++                }
++            }
++        }
++
++        clip_image_f32 chunk;
++        chunk.set_size({n_feed, (int) n_mel}, false, true);
++        chunk.cpy_buf(data);
++        std::vector<float> embd;
++        if (!clip_voicechat_stream_encode(ctx->ctx_a, ctx->n_threads, &chunk, drop, embd)) {
++            return false;
++        }
++        ctx->out_embd.insert(ctx->out_embd.end(), embd.begin(), embd.end());
++        ctx->voicechat_stream_n_frames += embd.size() / (size_t) ctx->n_embd_out();
++        return true;
++    };
++
++    if (ctx->voicechat_stream_mel_consumed == 0 && n_have >= 1) {
++        if (!encode(0, 1, 0)) {
++            return 1;
++        }
++        ctx->voicechat_stream_mel_consumed = 1;
++    }
++    while (n_have - ctx->voicechat_stream_mel_consumed >= 8) {
++        const int64_t start = (int64_t) ctx->voicechat_stream_mel_consumed - 9;
++        if (!encode(start, 17, 2)) {
++            return 1;
++        }
++        ctx->voicechat_stream_mel_consumed += 8;
++    }
++    return 0;
++}
++
++size_t mtmd_voicechat_stream_get_n_frames(const mtmd_context * ctx) {
++    return ctx ? ctx->voicechat_stream_n_frames : 0;
++}
++
+ //
+ // audio generation
+ //
+diff --git a/tools/mtmd/mtmd.h b/tools/mtmd/mtmd.h
+index c1a5921d..21888add 100644
+--- a/tools/mtmd/mtmd.h
++++ b/tools/mtmd/mtmd.h
+@@ -305,6 +305,15 @@ MTMD_API int32_t mtmd_encode_chunk(mtmd_context * ctx,
+ // llama_model_n_embd_inp(model) * mtmd_input_chunk_get_n_tokens(chunk) * sizeof(float)
+ MTMD_API float * mtmd_get_output_embd(mtmd_context * ctx);
+ 
++// VoiceChat cache-aware perception stream. Feed 16 kHz mono f32 PCM.
++// The output buffer contains zero or more new 12.5 Hz embeddings.
++MTMD_API int32_t mtmd_voicechat_stream_reset(mtmd_context * ctx);
++MTMD_API int32_t mtmd_voicechat_stream_feed(mtmd_context * ctx,
++                                            const float * samples,
++                                            size_t n_samples,
++                                            bool flush);
++MTMD_API size_t mtmd_voicechat_stream_get_n_frames(const mtmd_context * ctx);
++
+ 
+ // batch encoding API
+ // chunks are not owned by the batch, they will not be freed by mtmd_batch_free()
+diff --git a/tools/voicechat/voicechat-cli.cpp b/tools/voicechat/voicechat-cli.cpp
+index 70e5e116..a9dc9b95 100644
+--- a/tools/voicechat/voicechat-cli.cpp
++++ b/tools/voicechat/voicechat-cli.cpp
+@@ -24,6 +24,7 @@
+ //   llama-voicechat -m stt-llm.gguf --mmproj perception.gguf --serve
+ 
+ #include "arg.h"
++#include "base64.hpp"
+ #include "common.h"
+ #include "log.h"
+ #include "sampling.h"
+@@ -411,6 +412,28 @@ struct vc_session {
+     bool force_bos = getenv("VC_FORCE_BOS") != nullptr;
+     bool want_bos  = false;
+ 
++    // Streaming serve mode keeps both the perception cache and model timeline
++    // alive while microphone frames arrive one at a time.
++    bool                     duplex = false;
++    size_t                   duplex_encoder_frames = 0;
++    bool                     duplex_response = false;
++    bool                     duplex_eos = false;
++    bool                     duplex_initial_response = true;
++    bool                     duplex_input_speaking = false;
++    int64_t                  duplex_speech_epoch = 0;
++    int64_t                  duplex_consumed_speech_epoch = 0;
++    int                      duplex_response_first = 0;
++    int                      duplex_frames_after_eos = 0;
++    int                      duplex_pad_streak = 0;
++    int                      duplex_spoken = 0;
++    std::string              duplex_transcript;
++    bool                     duplex_in_call = false;
++    bool                     duplex_want_eotr = false;
++    int                      duplex_wait = 0;
++    std::string              duplex_call_buf;
++    std::vector<llama_token> duplex_inject;
++    size_t                   duplex_inject_i = 0;
++
+     vc_events ev;
+ 
+     // Asked for a tool result the moment the function channel closes a call. The
+@@ -428,6 +451,12 @@ struct vc_session {
+     void stream_audio(bool flush);
+     bool step(const float * a, bool conditioning, llama_token force_func, bool feed_tts);
+     bool run_system(const std::string & prompt);
++    bool start_duplex();
++    bool run_duplex_audio(const std::string & pcm_b64, int64_t seq,
++                          int64_t speech_epoch, bool input_speaking);
++    bool duplex_step(const float * a, bool feed_tts, llama_token force_func = -1);
++    void duplex_open_response();
++    void duplex_finish_response(const char * reason);
+     bool run_turn(const std::string & wav_path, const std::string & out_wav, json & result);
+ };
+ 
+@@ -567,6 +596,25 @@ void vc_session::reset() {
+     tts_voiced    = 0;
+     tts_wait      = 0;
+     tts_first_tok = -1;
++    duplex = false;
++    duplex_encoder_frames = 0;
++    duplex_response = false;
++    duplex_eos = false;
++    duplex_initial_response = true;
++    duplex_input_speaking = false;
++    duplex_speech_epoch = 0;
++    duplex_consumed_speech_epoch = 0;
++    duplex_response_first = 0;
++    duplex_frames_after_eos = 0;
++    duplex_pad_streak = 0;
++    duplex_spoken = 0;
++    duplex_transcript.clear();
++    duplex_in_call = false;
++    duplex_want_eotr = false;
++    duplex_wait = 0;
++    duplex_call_buf.clear();
++    duplex_inject.clear();
++    duplex_inject_i = 0;
+     if (tts) {
+         voicechat_tts_free(tts);
+         tts = nullptr;
+@@ -917,6 +965,265 @@ bool vc_session::run_system(const std::string & prompt) {
+     return true;
+ }
+ 
++void vc_session::duplex_finish_response(const char * reason) {
++    if (!duplex_response) {
++        return;
++    }
++    stream_audio(true);
++    ev.emit(json{{"kind", "response_end"},
++                 {"response", n_turns},
++                 {"reason", reason},
++                 {"text", duplex_transcript},
++                 {"frames", t - duplex_response_first},
++                 {"spoken", duplex_spoken},
++                 {"t", t}});
++    duplex_response = false;
++    duplex_eos = false;
++    duplex_consumed_speech_epoch = duplex_speech_epoch;
++    tts_first_tok = -1;
++    stream_next = -1;
++}
++
++void vc_session::duplex_open_response() {
++    if (duplex_response) {
++        // The text head can emit eos/bos while the speech decoder is still in
++        // the same audible utterance. Keep one API response until TTS settles,
++        // but do not let a held eos block the new text behind it.
++        const bool bos_was_blocked = !tts_q.empty();
++        tts_q.clear();
++        if (tts && bos_was_blocked) {
++            tts_q.push_back(tok_bos);
++        }
++        duplex_eos = false;
++        duplex_frames_after_eos = 0;
++        duplex_pad_streak = 0;
++        ev.emit(json{{"kind", "response_boundary"}, {"response", n_turns}, {"t", t - 1}});
++        return;
++    }
++    ++n_turns;
++    duplex_response = true;
++    duplex_eos = false;
++    duplex_initial_response = false;
++    duplex_response_first = t - 1;
++    duplex_frames_after_eos = 0;
++    duplex_pad_streak = 0;
++    duplex_spoken = 0;
++    duplex_transcript.clear();
++
++    tts_turn_first = tts ? voicechat_tts_n_frames(tts) : 0;
++    stream_next = -1;
++    stream_seq = 0;
++    tts_first_tok = -1;
++    tts_released = 0;
++    tts_voiced = 0;
++    tts_wait = 0;
++
++    ev.emit(json{{"kind", "response_start"}, {"response", n_turns}, {"t", t - 1}});
++}
++
++bool vc_session::duplex_step(const float * a, bool feed_tts, llama_token force_func) {
++    hold_bos = false;
++    want_bos = false;
++    // Once an audible response has completed, a quantized text head can emit a
++    // late bos and echo its final sentence over silence.  Keep advancing both
++    // model timelines, but hold the output heads at pad until the bridge has
++    // observed a genuinely new speech onset.  This is not a half-duplex turn
++    // gate: the first response and every armed response can still begin while
++    // the user is speaking, and a barge-in keeps the current response open.
++    const bool idle_conditioning = !duplex_response && !duplex_initial_response &&
++        duplex_speech_epoch <= duplex_consumed_speech_epoch;
++    if (!step(a, idle_conditioning, force_func, feed_tts)) {
++        return false;
++    }
++
++    const llama_token id = last_text;
++    if (id == tok_bos) {
++        duplex_open_response();
++    } else if (id == tok_eos) {
++        duplex_pad_streak = 0;
++        if (duplex_response) {
++            duplex_eos = true;
++            duplex_frames_after_eos = 0;
++        }
++    } else if (id != tok_pad) {
++        duplex_pad_streak = 0;
++        if (!duplex_response) {
++            // A quantized head may occasionally skip the bos boundary.
++            duplex_open_response();
++            if (tts && tts_first_tok < 0) {
++                tts_first_tok = std::max(tts_turn_first, voicechat_tts_n_frames(tts) - 1);
++            }
++        }
++        const std::string piece = common_token_to_piece(lctx, id, false);
++        if (!piece.empty()) {
++            ev.text_delta(piece);
++        }
++        duplex_transcript += common_token_to_piece(lctx, id, true);
++        ++duplex_spoken;
++    } else if (duplex_response) {
++        ++duplex_pad_streak;
++    }
++
++    if (has_fhead) {
++        const llama_token f = last_func;
++        if (f == fhead.tok_sotc) {
++            duplex_in_call = true;
++            duplex_wait = 0;
++            duplex_call_buf.clear();
++            LOG_INF("frame %d: sotc, duplex tool call starts\n", t);
++            ev.emit(json{{"kind", "tool_call_start"}, {"t", t}});
++        } else if (f == fhead.tok_eotc && duplex_in_call) {
++            duplex_in_call = false;
++            LOG_INF("frame %d: eotc, duplex tool call: %s\n", t, duplex_call_buf.c_str());
++            ev.emit(json{{"kind", "tool_call"}, {"t", t}, {"text", duplex_call_buf}});
++            std::string answer = on_tool_call ? on_tool_call(duplex_call_buf) : std::string();
++            if (!answer.empty()) {
++                if (answer.compare(0, 15, "<TOOL_RESPONSE>") != 0) {
++                    answer = "<TOOL_RESPONSE>[" + answer + "]</TOOL_RESPONSE>";
++                }
++                duplex_inject = common_tokenize(lctx, answer, false, true);
++                duplex_inject_i = 0;
++                duplex_wait = 0;
++                LOG_INF("frame %d: duplex tool response, %d tokens\n", t, (int) duplex_inject.size());
++                ev.emit(json{{"kind", "tool_response"}, {"t", t},
++                             {"text", answer}, {"tokens", (int) duplex_inject.size()}});
++            } else {
++                LOG_WRN("frame %d: no duplex tool response, the model answers without one\n", t);
++            }
++        } else if (f == fhead.tok_eotr) {
++            duplex_want_eotr = false;
++            LOG_INF("frame %d: eotr, duplex tool response ends\n", t);
++            ev.emit(json{{"kind", "tool_response_end"}, {"t", t}});
++        } else if (duplex_in_call) {
++            const std::string piece = common_token_to_piece(lctx, f);
++            duplex_call_buf += piece;
++            ev.func_delta(piece);
++        }
++
++        if (!duplex_inject.empty() && duplex_inject_i == duplex_inject.size() &&
++            !duplex_want_eotr && f != fhead.tok_eotr) {
++            duplex_inject.clear();
++            duplex_inject_i = 0;
++            duplex_want_eotr = true;
++            duplex_wait = 0;
++        }
++        if (duplex_want_eotr && duplex_wait > 8) {
++            ev.emit(json{{"kind", "warning"},
++                         {"message", "no eotr after the tool response"}});
++            duplex_want_eotr = false;
++        }
++        if (duplex_in_call && duplex_wait > 200) {
++            ev.emit(json{{"kind", "warning"},
++                         {"message", "tool call did not close after 200 frames"}});
++            duplex_in_call = false;
++        }
++    }
++
++    const bool text_done = duplex_eos ||
++        duplex_pad_streak >= (quiet_env > 0 ? quiet_env : n_quiet_frames);
++    if (duplex_response && text_done && feed_tts) {
++        ++duplex_frames_after_eos;
++        const bool speech_done = !tts ||
++            (tts_q.empty() && duplex_frames_after_eos >= n_drain_min &&
++             tts_quiet >= n_drain_quiet);
++        if (speech_done && !duplex_input_speaking) {
++            duplex_finish_response("completed");
++        }
++    }
++    return true;
++}
++
++bool vc_session::start_duplex() {
++    if (duplex) {
++        ev.error("duplex mode is already running");
++        return false;
++    }
++    sys_done = true;
++    if (mtmd_voicechat_stream_reset(ctx_mtmd.get()) != 0) {
++        ev.error("could not reset the streaming perception encoder");
++        return false;
++    }
++    duplex = true;
++    duplex_encoder_frames = 0;
++    duplex_initial_response = true;
++    duplex_input_speaking = false;
++    duplex_speech_epoch = 0;
++    duplex_consumed_speech_epoch = 0;
++    ev.emit(json{{"kind", "duplex_start"}, {"t", t}, {"frame_rate", 12.5}});
++    return true;
++}
++
++bool vc_session::run_duplex_audio(const std::string & pcm_b64, int64_t seq,
++                                  int64_t speech_epoch, bool input_speaking) {
++    if (!duplex) {
++        ev.error("audio_frame before duplex_start");
++        return false;
++    }
++    if (t >= n_frames_max) {
++        ev.emit(json{{"kind", "warning"}, {"message", "session frame cap reached"}});
++        ev.emit(json{{"kind", "duplex_frame"}, {"seq", seq}, {"frames", 0}, {"t", t}});
++        return true;
++    }
++
++    duplex_speech_epoch = std::max(duplex_speech_epoch, speech_epoch);
++    duplex_input_speaking = input_speaking;
++
++    std::string pcm;
++    try {
++        pcm = base64::decode(pcm_b64);
++    } catch (const std::exception & e) {
++        ev.error(std::string("invalid audio_frame base64: ") + e.what());
++        return false;
++    }
++    if ((pcm.size() & 1) != 0) {
++        ev.error("audio_frame has an odd PCM byte count");
++        return false;
++    }
++
++    std::vector<float> samples(pcm.size() / 2);
++    for (size_t i = 0; i < samples.size(); ++i) {
++        const uint16_t lo = (uint8_t) pcm[2 * i];
++        const uint16_t hi = (uint8_t) pcm[2 * i + 1];
++        samples[i] = (int16_t) (lo | (hi << 8)) / 32768.0f;
++    }
++    if (mtmd_voicechat_stream_feed(ctx_mtmd.get(), samples.data(), samples.size(), false) != 0) {
++        ev.error("streaming perception encoder failed");
++        return false;
++    }
++
++    const size_t total = mtmd_voicechat_stream_get_n_frames(ctx_mtmd.get());
++    const size_t n_new = total - duplex_encoder_frames;
++    const float * out = mtmd_get_output_embd(ctx_mtmd.get());
++    for (size_t i = 0; i < n_new && t < n_frames_max; ++i) {
++        if (!duplex_step(out + i * (size_t) n_embd, true)) {
++            return false;
++        }
++
++        // Tool calls are zero-audio positions. Complete the splice before the
++        // next microphone frame is accepted.
++        int frozen = 0;
++        while ((duplex_in_call || duplex_inject_i < duplex_inject.size() ||
++                duplex_want_eotr) && t < n_frames_max) {
++            llama_token force = -1;
++            if (duplex_inject_i < duplex_inject.size()) {
++                force = duplex_inject[duplex_inject_i++];
++            }
++            ++duplex_wait;
++            if (!duplex_step(nullptr, false, force)) {
++                return false;
++            }
++            if (++frozen > 512) {
++                ev.error("tool splice exceeded 512 frames");
++                return false;
++            }
++        }
++    }
++    duplex_encoder_frames = total;
++    ev.emit(json{{"kind", "duplex_frame"}, {"seq", seq},
++                 {"samples", samples.size()}, {"frames", n_new}, {"t", t}});
++    return true;
++}
++
+ // One turn: the user's audio, then decoding past it until the model falls quiet,
+ // then draining the speech channel until it settles.
+ bool vc_session::run_turn(const std::string & wav_path, const std::string & out_wav, json & result) {
+@@ -934,6 +1241,12 @@ bool vc_session::run_turn(const std::string & wav_path, const std::string & out_
+         ev.error(wav_path + " is not audio");
+         return false;
+     }
++    std::vector<float> compare_pcm;
++    if (getenv("VC_STREAM_COMPARE")) {
++        const size_t n = mtmd_bitmap_get_n_bytes(bmp.ptr.get()) / sizeof(float);
++        const float * pcm = reinterpret_cast<const float *>(mtmd_bitmap_get_data(bmp.ptr.get()));
++        compare_pcm.assign(pcm, pcm + n);
++    }
+ 
+     mtmd_input_text text;
+     text.text          = mtmd_get_marker(ctx_mtmd.get());
+@@ -974,6 +1287,39 @@ bool vc_session::run_turn(const std::string & wav_path, const std::string & out_
+     aud.resize((size_t) n_frames * n_embd);
+     memcpy(aud.data(), mtmd_get_output_embd(ctx_mtmd.get()), aud.size() * sizeof(float));
+ 
++    if (!compare_pcm.empty()) {
++        std::vector<float> streamed;
++        const int64_t t_stream = ggml_time_ms();
++        bool compare_ok = mtmd_voicechat_stream_reset(ctx_mtmd.get()) == 0;
++        for (size_t off = 0; compare_ok && off < compare_pcm.size(); off += 1280) {
++            const size_t n = std::min((size_t) 1280, compare_pcm.size() - off);
++            compare_ok = mtmd_voicechat_stream_feed(ctx_mtmd.get(), compare_pcm.data() + off, n, false) == 0;
++            if (compare_ok) {
++                const size_t n_new = mtmd_voicechat_stream_get_n_frames(ctx_mtmd.get()) - streamed.size() / n_embd;
++                const float * out = mtmd_get_output_embd(ctx_mtmd.get());
++                streamed.insert(streamed.end(), out, out + n_new * n_embd);
++            }
++        }
++        if (compare_ok && !streamed.empty()) {
++            const size_t n = std::min(streamed.size(), aud.size());
++            double abs_sum = 0.0;
++            float max_abs = 0.0f;
++            for (size_t i = 0; i < n; ++i) {
++                const float err = std::abs(streamed[i] - aud[i]);
++                abs_sum += err;
++                max_abs = std::max(max_abs, err);
++            }
++            ev.emit(json{{"kind", "stream_compare"},
++                         {"whole_frames", n_frames},
++                         {"stream_frames", streamed.size() / n_embd},
++                         {"stream_ms", ggml_time_ms() - t_stream},
++                         {"mean_abs", abs_sum / n},
++                         {"max_abs", max_abs}});
++        } else {
++            ev.error("streamed perception comparison failed");
++        }
++    }
++
+     LOG_INF("perception: %d frames (%.2f s at 12.5 Hz) in %" PRId64 " ms\n",
+             n_frames, n_frames / 12.5, ggml_time_ms() - t_enc);
+ 
+@@ -1292,6 +1638,9 @@ static json parse_line(const std::string & line, bool & ok) {
+ // stdin: one command object per line. stdout: one event object per line.
+ //
+ //   {"cmd":"system","text":"..."}                  before the first turn only
++//   {"cmd":"duplex_start"}
++//   {"cmd":"audio_frame","audio":"<base64 pcm16>","seq":0,
++//    "speech_epoch":1,"input_speaking":true}
+ //   {"cmd":"turn","audio":"in.wav","out":"out.wav"}
+ //   {"cmd":"tool_response","text":"..."}           only while a call is pending
+ //   {"cmd":"reset"} {"cmd":"ping"} {"cmd":"quit"}
+@@ -1369,7 +1718,27 @@ static int vc_serve(vc_session & sess) {
+             sess.ev.emit(json{{"kind", "system"}, {"t", sess.t}});
+             continue;
+         }
++        if (c == "duplex_start") {
++            if (!sess.start_duplex()) {
++                continue;
++            }
++            continue;
++        }
++        if (c == "audio_frame") {
++            if (!sess.run_duplex_audio(cmd.value("audio", ""), cmd.value("seq", (int64_t) -1),
++                                       cmd.value("speech_epoch", (int64_t) 0),
++                                       cmd.value("input_speaking", false))) {
++                sess.ev.emit(json{{"kind", "duplex_frame"},
++                                  {"seq", cmd.value("seq", (int64_t) -1)},
++                                  {"failed", true}, {"t", sess.t}});
++            }
++            continue;
++        }
+         if (c == "turn") {
++            if (sess.duplex) {
++                sess.ev.error("turn is unavailable after duplex_start");
++                continue;
++            }
+             const std::string wav = cmd.value("audio", "");
+             if (wav.empty()) {
+                 sess.ev.error("turn without an audio path");
+@@ -1416,7 +1785,10 @@ static void show_usage(int /*argc*/, char ** argv) {
+         "  --say reads a sentence out in the agent's voice instead of running the\n"
+         "  llm at all, which is how you make an English test clip without a mic.\n"
+         "  --serve keeps the process and the conversation alive and speaks json:\n"
+-        "    in   {\"cmd\":\"system\",\"text\":...} {\"cmd\":\"turn\",\"audio\":...,\"out\":...}\n"
++        "    in   {\"cmd\":\"system\",\"text\":...} {\"cmd\":\"duplex_start\"}\n"
++        "         {\"cmd\":\"audio_frame\",\"audio\":<base64 pcm16>,\"seq\":...,\n"
++        "          \"speech_epoch\":...,\"input_speaking\":...}\n"
++        "         {\"cmd\":\"turn\",\"audio\":...,\"out\":...}\n"
+         "         {\"cmd\":\"tool_response\",\"text\":...} {\"cmd\":\"reset\"} {\"cmd\":\"quit\"}\n"
+         "    out  ready, turn_start, assistant_text_delta, function_delta,\n"
+         "         tool_call, audio, turn_end, progress, error\n\n",
+diff --git a/tools/voicechat/voicechat-tts.cpp b/tools/voicechat/voicechat-tts.cpp
+index e150b909..83a30d1c 100644
+--- a/tools/voicechat/voicechat-tts.cpp
++++ b/tools/voicechat/voicechat-tts.cpp
+@@ -1245,2 +1245,2 @@ static std::vector<float> codec_decode(voicechat_tts * tts, const std::vector<fl
+-    const int chunk = 8, overlap = 8;
++    const int chunk = 32, overlap = 8;
+     std::vector<float> spec((size_t) n_spec * T * up_total);
